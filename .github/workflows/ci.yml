@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build:
+    name: build-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache ncnn build
+        id: cache-ncnn
+        uses: actions/cache@v4
+        with:
+          path: ncnn-install
+          key: ncnn-${{ matrix.os }}-master-v1
+
+      - name: Build ncnn (Linux)
+        if: runner.os == 'Linux' && steps.cache-ncnn.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/Tencent/ncnn.git
+          cmake -S ncnn -B ncnn/build -DCMAKE_BUILD_TYPE=Release \
+            -DNCNN_VULKAN=OFF -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_TOOLS=OFF \
+            -DNCNN_BUILD_TESTS=OFF -DNCNN_SIMPLEOCV=ON \
+            -DCMAKE_INSTALL_PREFIX=$PWD/ncnn-install
+          cmake --build ncnn/build --target install -j$(nproc)
+
+      - name: Build ncnn (Windows)
+        if: runner.os == 'Windows' && steps.cache-ncnn.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/Tencent/ncnn.git
+          cmake -S ncnn -B ncnn/build -DCMAKE_BUILD_TYPE=Release `
+            -DNCNN_VULKAN=OFF -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_TOOLS=OFF `
+            -DNCNN_BUILD_TESTS=OFF -DNCNN_SIMPLEOCV=ON `
+            -DCMAKE_INSTALL_PREFIX="$PWD/ncnn-install"
+          cmake --build ncnn/build --target install --config Release -j 2
+
+      - name: Configure & build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -Dncnn_DIR=$PWD/ncnn-install/lib/cmake/ncnn
+          cmake --build build -j$(nproc)
+
+      - name: Configure & build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+            -Dncnn_DIR="$PWD/ncnn-install/lib/cmake/ncnn"
+          cmake --build build --config Release -j 2
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure -C Release

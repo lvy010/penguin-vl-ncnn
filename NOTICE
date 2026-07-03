@@ -1,0 +1,21 @@
+Penguin-VL-ncnn
+Copyright 2026 The Penguin-VL-ncnn Authors
+
+This product includes software developed as part of the ncnn ecosystem.
+
+Portions of the runtime under third_party/ncnn_llm/ are derived from the
+ncnn_llm project (https://github.com/futz12/ncnn_llm), which is itself based on
+nihui's ncnn KV-cache experiments. Those files are used under the Apache
+License, Version 2.0 and retain their original behavior:
+
+  - bpe_tokenizer.{h,cpp}, tokenizer_types.h   (byte-level BPE tokenizer)
+  - rope_embed.{h,cpp}                          (RoPE / mRoPE caches, embed inject)
+  - vision_rope.{h,cpp}                         (2D vision RoPE cache)
+  - image_utils.{h,cpp}, stb_image.h           (image IO / resize; stb is public domain)
+  - sampling.{h,cpp}                            (top-k / top-p sampling)
+  - ncnn_llm_base.h                             (KVCache type + helpers)
+
+stb_image.h is by Sean Barrett and released into the public domain (or MIT).
+
+The Penguin-VL model architecture referenced by the export scripts is from
+tencent-ailab/Penguin-VL (Apache-2.0).

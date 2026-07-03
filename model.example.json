@@ -1,0 +1,47 @@
+{
+  "model_type": "penguinvl_qwen3",
+  "params": {
+    "embed_token_param": "embed.ncnn.param",
+    "embed_token_bin": "embed.ncnn.bin",
+    "decoder_param": "decoder.ncnn.param",
+    "decoder_bin": "decoder.ncnn.bin",
+    "lm_head_param": "lm_head.ncnn.param",
+    "lm_head_bin": "lm_head.ncnn.bin"
+  },
+  "tokenizer": {
+    "type": "bbpe",
+    "vocab_file": "vocab.txt",
+    "merges_file": "merges.txt",
+    "bos": "",
+    "eos": "<|im_end|>",
+    "additional_special_tokens": ["<|im_start|>", "<|im_end|>", "<image>", "<think>", "</think>"]
+  },
+  "setting": {
+    "hidden_size": 2048,
+    "attn_cnt": 28,
+    "system_prompt": "",
+    "rope": {
+      "type": "RoPE",
+      "rope_head_dim": 128,
+      "rope_theta": 1000000.0
+    },
+    "vision": {
+      "patch_embed_param": "vision_patch_embed.ncnn.param",
+      "patch_embed_bin": "vision_patch_embed.ncnn.bin",
+      "encoder_param": "vision_encoder.ncnn.param",
+      "encoder_bin": "vision_encoder.ncnn.bin",
+      "projector_param": "vision_projector.ncnn.param",
+      "projector_bin": "vision_projector.ncnn.bin",
+      "patch_size": 14,
+      "merge_size": 1,
+      "min_tokens": 16,
+      "max_tokens": 16384,
+      "vision_hidden": 1024,
+      "vision_head_dim": 128,
+      "vision_rope_theta": 1000000.0,
+      "image_mean": [0.5, 0.5, 0.5],
+      "image_std": [0.5, 0.5, 0.5],
+      "image_token": "<image>"
+    }
+  }
+}

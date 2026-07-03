@@ -1,0 +1,13 @@
+/build/
+/build-*/
+*.o
+*.a
+*.ncnn.param
+*.ncnn.bin
+_work/
+golden/
+/assets/*.bin
+/assets/*.param
+__pycache__/
+*.pyc
+*.pt
