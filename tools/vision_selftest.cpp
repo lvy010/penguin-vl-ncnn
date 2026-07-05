@@ -4,7 +4,10 @@
 // Penguin-VL-2B dims, random weights from tools/selftest_export.py) through the
 // C++ PenguinVision driver and run the full patch_embed -> encoder(2D-RoPE) ->
 // projector pipeline. Verifies the export<->runtime blob contract and shapes.
+#include <cmath>
 #include <cstdio>
+#include <exception>
+#include <string>
 
 #include <mat.h>
 
