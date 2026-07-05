@@ -46,10 +46,14 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install pnnx numpy transformers
 
 # 一键跑 L1–L3（构建 + 单测 + 契约自测 + 分词器对齐）
-pwsh tools/run_full_test.ps1 -NcnnDir "$PWD/ncnn-install/lib/cmake/ncnn"
+powershell -File tools/run_full_test.ps1 -NcnnDir "$PWD/ncnn-install/lib/cmake/ncnn"
 ```
 
 脚本会打印每个阶段的 PASS/FAIL 与末尾 SUMMARY，任一失败退出码非零。
+（用 Windows PowerShell 的 `powershell` 或 PowerShell 7 的 `pwsh` 均可。）
+
+> 本套流程已在 Windows / MSVC(VS2019 BuildTools) / ncnn `20260705` 上实测
+> **L1–L3 全绿**（`RESULT: PASS`）。
 
 ## 阶段 D —— 导出带权重模型（≥16 GB 内存，联网一次）
 
@@ -68,7 +72,7 @@ python tools\rename_decoder_blobs.py --param .\penguin-vl-2b-ncnn\decoder.ncnn.p
 ## 阶段 D/E —— 端到端 + PyTorch 对齐（一键）
 
 ```powershell
-pwsh tools/run_full_test.ps1 `
+powershell -File tools/run_full_test.ps1 `
   -NcnnDir "$PWD/ncnn-install/lib/cmake/ncnn" `
   -Model .\penguin-vl-2b-ncnn `
   -ReferenceModel .\Penguin-VL-2B `

@@ -59,10 +59,15 @@ class Attn(nn.Module):
         self.k_norm = RMSNorm(hd)
 
     def forward(self, x, cos, sin):
-        N = x.shape[1]
-        q = self.q_norm(self.q_proj(x).view(1, N, self.nh, self.hd)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(x).view(1, N, self.nkv, self.hd)).transpose(1, 2)
-        v = self.v_proj(x).view(1, N, self.nkv, self.hd).transpose(1, 2)
+        # x is (N, H). Keep the Linear/Gemm ops in 2D (ncnn Gemm is exact on 2D
+        # but collapses the token dim on a batched 3D input). For attention, add
+        # an explicit batch=1 at dim 0 so pnnx strips it and emits clean 3D
+        # (heads, N, hd) batched matmuls — dim 0 must stay the batch and never be
+        # permuted (pnnx cannot transpose the batch axis).
+        N = x.shape[0]
+        q = self.q_norm(self.q_proj(x).view(N, self.nh, self.hd)).unsqueeze(0).transpose(1, 2)
+        k = self.k_norm(self.k_proj(x).view(N, self.nkv, self.hd)).unsqueeze(0).transpose(1, 2)
+        v = self.v_proj(x).view(N, self.nkv, self.hd).unsqueeze(0).transpose(1, 2)
         c = cos.view(1, 1, N, self.hd)
         s = sin.view(1, 1, N, self.hd)
         q = q * c + rotate_half(q) * s
@@ -72,7 +77,7 @@ class Attn(nn.Module):
         v = repeat_kv(v, rep)
         att = torch.matmul(q, k.transpose(-1, -2)) / (self.hd ** 0.5)
         att = torch.softmax(att, dim=-1)
-        o = torch.matmul(att, v).transpose(1, 2).reshape(1, N, -1)
+        o = torch.matmul(att, v).transpose(1, 2).reshape(N, -1)
         return self.o_proj(o)
 
 
@@ -108,10 +113,10 @@ class VisionEncoder(nn.Module):
         self.norm = RMSNorm(h)
 
     def forward(self, hidden, cos, sin):
-        x = hidden.unsqueeze(0)
+        x = hidden  # (N, H); batch-free so pnnx emits clean 2D Gemms
         for l in self.layers:
             x = l(x, cos, sin)
-        return self.norm(x).squeeze(0)
+        return self.norm(x)
 
 
 class PatchEmbed(nn.Module):
@@ -143,8 +148,9 @@ class DecoderKV(nn.Module):
         self.nh, self.nkv, self.hd = nh, nkv, hd
 
     def forward(self, hidden, mask, cos, sin, *caches):
-        x = hidden.unsqueeze(0)
-        seq = x.shape[1]
+        # Batch-free token stream (see Attn.forward): 2D Gemms, batch=1 attention.
+        x = hidden
+        seq = x.shape[0]
         c = cos.view(1, 1, seq, self.hd)
         s = sin.view(1, 1, seq, self.hd)
         rep = self.nh // self.nkv
@@ -152,9 +158,9 @@ class DecoderKV(nn.Module):
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
             h = layer.input_layernorm(x)
-            q = attn.q_norm(attn.q_proj(h).view(1, seq, self.nh, self.hd)).transpose(1, 2)
-            k = attn.k_norm(attn.k_proj(h).view(1, seq, self.nkv, self.hd)).transpose(1, 2)
-            v = attn.v_proj(h).view(1, seq, self.nkv, self.hd).transpose(1, 2)
+            q = attn.q_norm(attn.q_proj(h).view(seq, self.nh, self.hd)).unsqueeze(0).transpose(1, 2)
+            k = attn.k_norm(attn.k_proj(h).view(seq, self.nkv, self.hd)).unsqueeze(0).transpose(1, 2)
+            v = attn.v_proj(h).view(seq, self.nkv, self.hd).unsqueeze(0).transpose(1, 2)
             q = q * c + rotate_half(q) * s
             k = k * c + rotate_half(k) * s
             pk = caches[2 * i].unsqueeze(0).transpose(1, 2)
@@ -166,10 +172,10 @@ class DecoderKV(nn.Module):
             kk, vv = repeat_kv(k, rep), repeat_kv(v, rep)
             att = torch.matmul(q, kk.transpose(-1, -2)) / (self.hd ** 0.5) + mask.view(1, 1, seq, -1)
             att = torch.softmax(att, dim=-1)
-            o = torch.matmul(att, vv).transpose(1, 2).reshape(1, seq, -1)
+            o = torch.matmul(att, vv).transpose(1, 2).reshape(seq, -1)
             x = x + attn.o_proj(o)
             x = x + layer.mlp(layer.post_attention_layernorm(x))
-        return (self.norm(x).squeeze(0), *outs)
+        return (self.norm(x), *outs)
 
 
 def export(module, example, shapes, prefix):

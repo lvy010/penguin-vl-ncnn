@@ -48,8 +48,12 @@ class Qwen3DecoderKV(torch.nn.Module):
 
     def forward(self, hidden, mask, cos, sin, *caches):
         # hidden (seq, H); cos/sin (seq, hd); caches = [k0,v0,k1,v1,...] (past, nkv, hd)
-        x = hidden.unsqueeze(0)
-        seq = x.shape[1]
+        # Keep the token-feature stream 2D (seq, H) so pnnx->ncnn emits clean 2D
+        # Gemms (a batched 3D input makes the current ncnn Gemm collapse the token
+        # dim). Attention adds an explicit batch=1 at dim 0 that pnnx strips, giving
+        # 3D (heads, seq, hd) batched matmuls; dim 0 stays the batch, never permuted.
+        x = hidden
+        seq = x.shape[0]
         cos_ = cos.view(1, 1, seq, self.hd)
         sin_ = sin.view(1, 1, seq, self.hd)
         outs = []
@@ -58,9 +62,9 @@ class Qwen3DecoderKV(torch.nn.Module):
             residual = x
             h = layer.input_layernorm(x)
             attn = layer.self_attn
-            q = attn.q_norm(attn.q_proj(h).view(1, seq, self.nh, self.hd)).transpose(1, 2)
-            k = attn.k_norm(attn.k_proj(h).view(1, seq, self.nkv, self.hd)).transpose(1, 2)
-            v = attn.v_proj(h).view(1, seq, self.nkv, self.hd).transpose(1, 2)
+            q = attn.q_norm(attn.q_proj(h).view(seq, self.nh, self.hd)).unsqueeze(0).transpose(1, 2)
+            k = attn.k_norm(attn.k_proj(h).view(seq, self.nkv, self.hd)).unsqueeze(0).transpose(1, 2)
+            v = attn.v_proj(h).view(seq, self.nkv, self.hd).unsqueeze(0).transpose(1, 2)
             q = q * cos_ + rotate_half(q) * sin_
             k = k * cos_ + rotate_half(k) * sin_
 
@@ -78,13 +82,13 @@ class Qwen3DecoderKV(torch.nn.Module):
             scores = torch.matmul(q, kk.transpose(-1, -2)) / (self.hd ** 0.5)
             scores = scores + mask.view(1, 1, seq, -1)
             probs = torch.softmax(scores, dim=-1)
-            o = torch.matmul(probs, vv).transpose(1, 2).reshape(1, seq, -1)
+            o = torch.matmul(probs, vv).transpose(1, 2).reshape(seq, -1)
             x = residual + attn.o_proj(o)
             residual = x
             h = layer.post_attention_layernorm(x)
             x = residual + layer.mlp(h)
         x = self.norm(x)
-        return (x.squeeze(0), *outs)
+        return (x, *outs)
 
 
 def main():

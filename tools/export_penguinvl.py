@@ -115,31 +115,36 @@ class VisionEncoder(torch.nn.Module):
         self.eps = eps
 
     def forward(self, hidden, cos, sin):  # hidden (N, H), cos/sin (N, head_dim)
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
-        x = hidden.unsqueeze(0)  # (1, N, H)
+        # Keep the token-feature stream 2D (N, H) so pnnx->ncnn emits clean 2D
+        # Gemms: a batched 3D input makes the current ncnn Gemm collapse the token
+        # dim. Attention adds an explicit batch=1 at dim 0 (which pnnx strips) to
+        # get 3D (heads, N, hd) batched matmuls; dim 0 stays the batch and is
+        # never permuted, since pnnx cannot transpose the batch axis.
+        x = hidden  # (N, H)
+        c = cos.view(1, 1, cos.shape[0], self.head_dim)
+        s = sin.view(1, 1, sin.shape[0], self.head_dim)
         for layer in self.layers:
             residual = x
             h = layer.input_layernorm(x)
             attn = layer.self_attn
-            N = h.shape[1]
-            q = attn.q_norm(attn.q_proj(h).view(1, N, self.num_heads, self.head_dim)).transpose(1, 2)
-            k = attn.k_norm(attn.k_proj(h).view(1, N, self.num_kv_heads, self.head_dim)).transpose(1, 2)
-            v = attn.v_proj(h).view(1, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            q = q * cos.unsqueeze(1) + rotate_half(q) * sin.unsqueeze(1)
-            k = k * cos.unsqueeze(1) + rotate_half(k) * sin.unsqueeze(1)
+            N = h.shape[0]
+            q = attn.q_norm(attn.q_proj(h).view(N, self.num_heads, self.head_dim)).unsqueeze(0).transpose(1, 2)
+            k = attn.k_norm(attn.k_proj(h).view(N, self.num_kv_heads, self.head_dim)).unsqueeze(0).transpose(1, 2)
+            v = attn.v_proj(h).view(N, self.num_kv_heads, self.head_dim).unsqueeze(0).transpose(1, 2)
+            q = q * c + rotate_half(q) * s
+            k = k * c + rotate_half(k) * s
             rep = self.num_heads // self.num_kv_heads
             k = repeat_kv(k, rep)
             v = repeat_kv(v, rep)
             scores = torch.matmul(q, k.transpose(-1, -2)) / (self.head_dim ** 0.5)
             probs = torch.softmax(scores, dim=-1)
-            o = torch.matmul(probs, v).transpose(1, 2).reshape(1, N, -1)
+            o = torch.matmul(probs, v).transpose(1, 2).reshape(N, -1)
             x = residual + attn.o_proj(o)
             residual = x
             h = layer.post_attention_layernorm(x)
             x = residual + layer.mlp(h)
         x = self.norm(x)
-        return x.squeeze(0)  # (N, H)
+        return x  # (N, H)
 
 
 class Projector(torch.nn.Module):

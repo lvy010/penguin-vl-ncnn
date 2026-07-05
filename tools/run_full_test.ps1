@@ -7,12 +7,14 @@
 # release. Phases requiring the weighted model are skipped unless you pass
 # -Model (and -ReferenceModel for the PyTorch equality check).
 #
+# Works with Windows PowerShell 5.1 (powershell.exe) and PowerShell 7 (pwsh).
+#
 # Examples:
 #   # Toolchain-level suite only (no multi-GB model): build + unit + self-tests
-#   pwsh tools/run_full_test.ps1 -NcnnDir "$PWD/ncnn-install/lib/cmake/ncnn"
+#   powershell -File tools/run_full_test.ps1 -NcnnDir "$PWD/ncnn-install/lib/cmake/ncnn"
 #
 #   # Full production run incl. real image->scene inference + PyTorch equality
-#   pwsh tools/run_full_test.ps1 `
+#   powershell -File tools/run_full_test.ps1 `
 #       -NcnnDir "$PWD/ncnn-install/lib/cmake/ncnn" `
 #       -Model .\penguin-vl-2b-ncnn `
 #       -ReferenceModel .\Penguin-VL-2B `
@@ -32,7 +34,10 @@ param(
     [switch]$SkipSelftest
 )
 
-$ErrorActionPreference = "Stop"
+# Native tools (cmake, pnnx, hf, python) legitimately write progress/warnings to
+# stderr; do NOT let that abort the driver. We gate every phase on explicit exit
+# codes and output matching instead.
+$ErrorActionPreference = "Continue"
 $script:Results = New-Object System.Collections.Generic.List[object]
 
 function Record([string]$Name, [bool]$Ok, [string]$Detail = "") {
@@ -45,6 +50,21 @@ function Have([string]$cmd) {
     return [bool](Get-Command $cmd -ErrorAction SilentlyContinue)
 }
 
+# Run a native command, capturing stdout+stderr into a string via a temp file and
+# returning the exit code through [ref]. Using a file (not `2>&1 | Out-String`)
+# avoids a Windows PowerShell deadlock when a child (e.g. pnnx) floods stderr.
+function Invoke-Native([string]$File, [string[]]$CmdArgs, [ref]$Out) {
+    $tmp = [System.IO.Path]::GetTempFileName()
+    # `*>` sends every stream to a file; unlike `2>&1 | Out-String` this cannot
+    # deadlock when a child (pnnx) floods stderr. Splatting @CmdArgs preserves
+    # argument boundaries. ($Args would collide with the automatic variable.)
+    & $File @CmdArgs *> $tmp
+    $rc = $LASTEXITCODE
+    $Out.Value = (Get-Content -Raw $tmp -ErrorAction SilentlyContinue)
+    Remove-Item $tmp -ErrorAction SilentlyContinue
+    return $rc
+}
+
 function Summary {
     Write-Host ""
     Write-Host "==================== SUMMARY ===================="
@@ -55,6 +75,7 @@ function Summary {
         exit 1
     }
     Write-Host "RESULT: PASS" -ForegroundColor Green
+    exit 0
 }
 
 Write-Host "==================================================================="
@@ -63,64 +84,57 @@ Write-Host "==================================================================="
 
 # ---- Phase 1: build -------------------------------------------------------
 if (-not $SkipBuild) {
-    try {
-        cmake -S . -B $BuildDir -DCMAKE_BUILD_TYPE=Release -Dncnn_DIR="$NcnnDir"
-        if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
-        cmake --build $BuildDir --config Release -j $Jobs
-        if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
-        Record "1. Build (CMake + MSVC, Release)" $true
-    } catch {
-        Record "1. Build (CMake + MSVC, Release)" $false $_.Exception.Message
-        Summary; exit 1
+    cmake -S . -B $BuildDir -DCMAKE_BUILD_TYPE=Release -Dncnn_DIR="$NcnnDir" | Out-Host
+    $cfgOk = ($LASTEXITCODE -eq 0)
+    if ($cfgOk) {
+        cmake --build $BuildDir --config Release -j $Jobs | Out-Host
+        $cfgOk = ($LASTEXITCODE -eq 0)
     }
+    Record "1. Build (CMake + MSVC, Release)" $cfgOk
+    if (-not $cfgOk) { Summary }
 } else {
     Record "1. Build" $true "skipped (-SkipBuild)"
 }
 
 # ---- Phase 2: unit tests --------------------------------------------------
-try {
-    ctest --test-dir $BuildDir --output-on-failure -C Release
-    Record "2. Unit tests (ctest)" ($LASTEXITCODE -eq 0)
-} catch {
-    Record "2. Unit tests (ctest)" $false $_.Exception.Message
-}
+ctest --test-dir $BuildDir --output-on-failure -C Release | Out-Host
+Record "2. Unit tests (ctest)" ($LASTEXITCODE -eq 0)
 
 # ---- Phase 3: weight-free contract self-tests -----------------------------
 if (-not $SkipSelftest) {
     if (Have "python") {
         $stDir = "pvl_selftest"
-        try {
-            python tools/selftest_export.py --out $stDir --layers 2 --n 100
-            $exportOk = ($LASTEXITCODE -eq 0)
-            Record "3a. pnnx export (real dims, random weights)" $exportOk
 
-            if ($exportOk) {
-                cmake --build $BuildDir --target vision_selftest --config Release
-                $vs = & ".\$BuildDir\Release\vision_selftest.exe" $stDir 2>&1 | Out-String
-                Write-Host $vs
-                Record "3b. Vision pipeline self-test" ($vs -match "SELFTEST PASS")
+        $o = ""
+        $rc = Invoke-Native "python" @("tools/selftest_export.py", "--out", $stDir, "--layers", "2", "--n", "100") ([ref]$o)
+        $exportOk = ($rc -eq 0) -and (Test-Path "$stDir/vision_encoder.ncnn.param")
+        Record "3a. pnnx export (real dims, random weights)" $exportOk
 
-                python tools/rename_decoder_blobs.py --param "$stDir/decoder.ncnn.param" --layers 2
-                Record "3c. Decoder KV-cache blob rename" ($LASTEXITCODE -eq 0)
-            }
-        } catch {
-            Record "3. Contract self-tests" $false $_.Exception.Message
+        if ($exportOk) {
+            cmake --build $BuildDir --target vision_selftest --config Release | Out-Host
+            $vs = ""
+            [void](Invoke-Native ".\$BuildDir\Release\vision_selftest.exe" @($stDir) ([ref]$vs))
+            Write-Host $vs
+            Record "3b. Vision pipeline self-test" ($vs -match "SELFTEST PASS")
+
+            $o2 = ""
+            $rc2 = Invoke-Native "python" @("tools/rename_decoder_blobs.py", "--param", "$stDir/decoder.ncnn.param", "--layers", "2") ([ref]$o2)
+            $names = (Select-String -Path "$stDir/decoder.ncnn.param" -Pattern "out_cache_k0|out_cache_v0" -ErrorAction SilentlyContinue)
+            Record "3c. Decoder KV-cache blob rename" (($rc2 -eq 0) -and ($null -ne $names))
         }
 
         # tokenizer bit-exactness (needs transformers + net for ~10MB tokenizer)
-        try {
-            $tokDir = "pvl_tok"
-            python tools/extract_tokenizer.py --model tencent/Penguin-VL-2B --out $tokDir
-            if ($LASTEXITCODE -eq 0) {
-                cmake --build $BuildDir --target tok_selftest --config Release
-                $ts = & ".\$BuildDir\Release\tok_selftest.exe" $tokDir 2>&1 | Out-String
-                Write-Host $ts
-                Record "3d. Tokenizer == HuggingFace (bit-exact)" ($ts -match "TOKENIZER SELFTEST PASS")
-            } else {
-                Record "3d. Tokenizer == HuggingFace" $false "extract_tokenizer failed (net/transformers?)"
-            }
-        } catch {
-            Record "3d. Tokenizer == HuggingFace" $false $_.Exception.Message
+        $tokDir = "pvl_tok"
+        $ot = ""
+        $rct = Invoke-Native "python" @("tools/extract_tokenizer.py", "--model", "tencent/Penguin-VL-2B", "--out", $tokDir) ([ref]$ot)
+        if (($rct -eq 0) -and (Test-Path "$tokDir/vocab.txt")) {
+            cmake --build $BuildDir --target tok_selftest --config Release | Out-Host
+            $ts = ""
+            [void](Invoke-Native ".\$BuildDir\Release\tok_selftest.exe" @($tokDir) ([ref]$ts))
+            Write-Host $ts
+            Record "3d. Tokenizer == HuggingFace (bit-exact)" ($ts -match "TOKENIZER SELFTEST PASS")
+        } else {
+            Record "3d. Tokenizer == HuggingFace" $false "extract_tokenizer failed (network/transformers?)"
         }
     } else {
         Record "3. Contract self-tests" $false "python not found on PATH"
@@ -137,19 +151,16 @@ if ($Model -ne "") {
     } elseif (-not (Test-Path $Model)) {
         Record "4. Real inference" $false "model dir not found: $Model"
     } else {
-        $imgs = @(Get-ChildItem -Path $AssetsDir -Include *.jpg,*.jpeg,*.png,*.bmp -File -Recurse -ErrorAction SilentlyContinue)
+        $imgs = @(Get-ChildItem -Path $AssetsDir -Include *.jpg, *.jpeg, *.png, *.bmp -File -Recurse -ErrorAction SilentlyContinue)
         if ($imgs.Count -eq 0) {
             Record "4. Real inference" $false "no images under $AssetsDir"
         } else {
             foreach ($img in $imgs) {
-                try {
-                    $out = & $exe --model $Model --image $img.FullName --prompt $Prompt --threads $Threads 2>&1 | Out-String
-                    Write-Host "----- $($img.Name) -----"
-                    Write-Host $out
-                    Record "4. Inference: $($img.Name)" ($out.Trim().Length -gt 0) "non-empty output"
-                } catch {
-                    Record "4. Inference: $($img.Name)" $false $_.Exception.Message
-                }
+                $out = ""
+                [void](Invoke-Native $exe @("--model", $Model, "--image", $img.FullName, "--prompt", $Prompt, "--threads", "$Threads") ([ref]$out))
+                Write-Host "----- $($img.Name) -----"
+                Write-Host $out
+                Record "4. Inference: $($img.Name)" ($out.Trim().Length -gt 0) "non-empty output"
             }
         }
     }
@@ -159,18 +170,16 @@ if ($Model -ne "") {
 
 # ---- Phase 5: PyTorch text equality (golden diff) -------------------------
 if ($Model -ne "" -and $ReferenceModel -ne "") {
-    $imgs = @(Get-ChildItem -Path $AssetsDir -Include *.jpg,*.jpeg,*.png,*.bmp -File -Recurse -ErrorAction SilentlyContinue)
+    $imgs = @(Get-ChildItem -Path $AssetsDir -Include *.jpg, *.jpeg, *.png, *.bmp -File -Recurse -ErrorAction SilentlyContinue)
     if ($imgs.Count -gt 0 -and (Have "python")) {
         $img = $imgs[0]
-        try {
-            python tools/compare_reference.py --model $ReferenceModel --image $img.FullName --prompt $Prompt --out golden
-            $golden = Get-Content -Raw "golden/output.txt" -ErrorAction SilentlyContinue
-            $ncnn = & ".\$BuildDir\Release\penguinvl.exe" --model $Model --image $img.FullName --prompt $Prompt --threads $Threads 2>&1 | Out-String
-            $match = ($null -ne $golden) -and ($ncnn.Trim() -eq $golden.Trim())
-            Record "5. ncnn text == PyTorch (greedy, $($img.Name))" $match
-        } catch {
-            Record "5. ncnn text == PyTorch" $false $_.Exception.Message
-        }
+        $og = ""
+        [void](Invoke-Native "python" @("tools/compare_reference.py", "--model", $ReferenceModel, "--image", $img.FullName, "--prompt", $Prompt, "--out", "golden") ([ref]$og))
+        $golden = Get-Content -Raw "golden/output.txt" -ErrorAction SilentlyContinue
+        $ncnn = ""
+        [void](Invoke-Native ".\$BuildDir\Release\penguinvl.exe" @("--model", $Model, "--image", $img.FullName, "--prompt", $Prompt, "--threads", "$Threads") ([ref]$ncnn))
+        $match = ($null -ne $golden) -and ($ncnn.Trim() -eq $golden.Trim())
+        Record "5. ncnn text == PyTorch (greedy, $($img.Name))" $match
     } else {
         Record "5. ncnn text == PyTorch" $false "need images + python"
     }
