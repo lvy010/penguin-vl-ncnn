@@ -4,9 +4,9 @@
 // Penguin-VL-2B dims, random weights from tools/selftest_export.py) through the
 // C++ PenguinVision driver and run the full patch_embed -> encoder(2D-RoPE) ->
 // projector pipeline. Verifies the export<->runtime blob contract and shapes.
-#include <cmath>
 #include <cstdio>
 #include <exception>
+#include <limits>
 #include <string>
 
 #include <mat.h>
@@ -52,7 +52,11 @@ int main(int argc, char** argv) {
         float s = 0.f;
         for (int j = 0; j < out.w; ++j) s += p[j] * p[j];
         std::printf("row0 L2^2=%.4f\n", s);
-        ok = ok && (s > 0.f) && std::isfinite(s);
+        // Toolchain-independent finite check (avoids std::isfinite, which is
+        // unreliable across some MSVC <cmath> configurations): s == s rejects
+        // NaN, and the bound comparison rejects +/-inf.
+        const bool finite = (s == s) && (s < std::numeric_limits<float>::infinity());
+        ok = ok && (s > 0.f) && finite;
 
         std::printf(ok ? "SELFTEST PASS\n" : "SELFTEST FAIL\n");
         return ok ? 0 : 1;
