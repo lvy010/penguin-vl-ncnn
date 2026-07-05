@@ -108,6 +108,13 @@ fixed (prompt, image). Run the same inputs through `penguinvl` and diff. See
 [docs/ALIGNMENT.md](docs/ALIGNMENT.md) for the layer-by-layer methodology and
 known alignment caveats (the resize kernel is the main risk).
 
+## Test report
+
+A full deliverable test run (build, 10/10 unit tests, pnnx export↔runtime
+contract self-test on real Penguin-VL-2B dims, decoder KV-cache contract, and
+bit-exact tokenizer vs HuggingFace) is captured in
+[docs/TESTREPORT.md](docs/TESTREPORT.md).
+
 ## Layout
 
 ```
