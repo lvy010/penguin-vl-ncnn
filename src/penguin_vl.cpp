@@ -193,6 +193,8 @@ std::string PenguinVL::chat(const std::string& user_text, const std::string& ima
         std::string output;
         for (int step = 0; step < cfg.max_new_tokens; ++step) {
             const int n = running.h;
+            // 2D causal mask (w=kv, h=seq); the graph reshapes it to (kv,seq,1)
+            // internally to broadcast over attention heads.
             ncnn::Mat mask = make_causal_mask(n, 0);
             ncnn::Mat cos_c, sin_c;
             generate_rope_embed_cache_full(n, head_dim, 0, cos_c, sin_c, theta);

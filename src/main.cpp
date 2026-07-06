@@ -4,10 +4,45 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "penguin_vl.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#pragma comment(lib, "shell32")
+#endif
+
 namespace {
+
+#ifdef _WIN32
+// On Windows the ANSI argv is encoded in the active code page (e.g. GBK/936),
+// which corrupts non-ASCII prompts before they reach the (UTF-8) tokenizer.
+// Rebuild argv from the wide command line and re-encode every argument as UTF-8.
+std::vector<std::string> utf8_args_storage;
+std::vector<char*> utf8_argv_ptrs;
+void make_utf8_argv(int& argc, char**& argv) {
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv) return;
+    SetConsoleOutputCP(CP_UTF8);
+    utf8_args_storage.reserve(wargc);
+    for (int i = 0; i < wargc; ++i) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string s(len > 0 ? len - 1 : 0, '\0');
+        if (len > 1) WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, s.data(), len, nullptr, nullptr);
+        utf8_args_storage.push_back(std::move(s));
+    }
+    LocalFree(wargv);
+    utf8_argv_ptrs.reserve(utf8_args_storage.size() + 1);
+    for (auto& s : utf8_args_storage) utf8_argv_ptrs.push_back(s.data());
+    utf8_argv_ptrs.push_back(nullptr);
+    argc = wargc;
+    argv = utf8_argv_ptrs.data();
+}
+#endif
+
 
 void print_usage(const char* argv0) {
     std::printf(
@@ -39,6 +74,9 @@ std::string next_arg(int& i, int argc, char** argv, const char* name) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    make_utf8_argv(argc, argv);
+#endif
     std::string model_dir, image_path, prompt;
     int threads = 4;
     pvl::GenerateConfig cfg;

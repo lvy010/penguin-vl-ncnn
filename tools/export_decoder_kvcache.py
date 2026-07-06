@@ -47,12 +47,33 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+def patch_mask_reshape(param_path):
+    """pnnx converts the (dynamic) 2D causal-mask broadcast into a Reshape with
+    two inferred (-1) axes (`0=-1 1=-1 2=1`), which ncnn cannot resolve. Rewrite
+    those to `0=0 1=0 2=1` ("copy w, copy h, set c=1"), giving a valid dynamic
+    (kv, seq, 1) mask that broadcasts over the attention heads."""
+    with open(param_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    n = text.count("0=-1 1=-1 2=1")
+    if n:
+        text = text.replace("0=-1 1=-1 2=1", "0=0 1=0 2=1")
+        with open(param_path, "w", encoding="utf-8") as f:
+            f.write(text)
+    print(f"[patch] rewrote {n} ambiguous mask Reshape op(s) to copy-dim form",
+          flush=True)
+
+
 def repeat_kv(x, rep):
-    # GQA head expansion via expand+reshape (pnnx->ncnn friendly).
+    # GQA head expansion. Use repeat() with STATIC tile counts (not expand,
+    # which under dynamic shapes lowers to pnnx.Expression + Tensor.expand that
+    # ncnn cannot load) and a reshape whose only dynamic axis is the inferred
+    # sequence length (-1). x: (1, nkv, n, hd) -> (1, nkv*rep, n, hd) with each
+    # kv head repeated rep times consecutively (standard GQA grouping).
     if rep == 1:
         return x
-    b, nkv, n, hd = x.shape
-    return x[:, :, None, :, :].expand(b, nkv, rep, n, hd).reshape(b, nkv * rep, n, hd)
+    nh = x.shape[1] * rep
+    x = x[:, :, None, :, :].repeat(1, 1, rep, 1, 1)   # (1, nkv, rep, n, hd)
+    return x.reshape(1, nh, -1, x.shape[-1])
 
 
 class Qwen3DecoderKV(torch.nn.Module):
@@ -97,16 +118,19 @@ class Qwen3DecoderKV(torch.nn.Module):
         # which sidesteps the KV-cache concat path that pnnx cannot lower here.
         x = hidden
         seq = x.shape[0]
-        cos_ = cos.view(1, 1, seq, self.hd)
-        sin_ = sin.view(1, 1, seq, self.hd)
+        cos_ = cos.view(1, 1, -1, self.hd)
+        sin_ = sin.view(1, 1, -1, self.hd)
         outs = []
         rep = self.nh // self.nkv
         for i, m in enumerate(self.layers):
             residual = x
             h = m["input_layernorm"](x)
-            q = m["q_norm"](m["q_proj"](h).view(seq, self.nh, self.hd)).unsqueeze(0).transpose(1, 2)
-            k = m["k_norm"](m["k_proj"](h).view(seq, self.nkv, self.hd)).unsqueeze(0).transpose(1, 2)
-            v = m["v_proj"](h).view(seq, self.nkv, self.hd).unsqueeze(0).transpose(1, 2)
+            # Use view(-1, ...) / reshape(-1, ...) and broadcast the mask so pnnx
+            # emits Reshape ops with an inferred (-1) axis instead of pnnx.Expression
+            # nodes -- ncnn cannot load Expression layers.
+            q = m["q_norm"](m["q_proj"](h).view(-1, self.nh, self.hd)).unsqueeze(0).transpose(1, 2)
+            k = m["k_norm"](m["k_proj"](h).view(-1, self.nkv, self.hd)).unsqueeze(0).transpose(1, 2)
+            v = m["v_proj"](h).view(-1, self.nkv, self.hd).unsqueeze(0).transpose(1, 2)
             q = q * cos_ + rotate_half(q) * sin_
             k = k * cos_ + rotate_half(k) * sin_
 
@@ -122,9 +146,9 @@ class Qwen3DecoderKV(torch.nn.Module):
             kk = repeat_kv(k, rep)
             vv = repeat_kv(v, rep)
             scores = torch.matmul(q, kk.transpose(-1, -2)) / (self.hd ** 0.5)
-            scores = scores + mask.view(1, 1, seq, -1)
+            scores = scores + mask                       # broadcast (seq,kv_len) over (1,nh,seq,kv_len)
             probs = torch.softmax(scores, dim=-1)
-            o = torch.matmul(probs, vv).transpose(1, 2).reshape(seq, -1)
+            o = torch.matmul(probs, vv).transpose(1, 2).reshape(-1, self.nh * self.hd)
             x = residual + m["o_proj"](o)
             residual = x
             h = m["post_attention_layernorm"](x)
@@ -148,6 +172,8 @@ def main():
                          "sidesteps pnnx/ncnn KV-cache concat limitations.")
     ap.add_argument("--name", default="decoder",
                     help="output basename (e.g. decoder / decoder_nocache)")
+    ap.add_argument("--layers", type=int, default=0,
+                    help="if >0, only export the first N decoder layers (diagnostic)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -158,6 +184,10 @@ def main():
                                                  trust_remote_code=True).float().eval()
     print("[decoder] model loaded", flush=True)
     cfg = model.config
+    if args.layers > 0:
+        model.model.layers = model.model.layers[:args.layers]
+        cfg.num_hidden_layers = args.layers
+        print(f"[decoder] truncated to {args.layers} layer(s)", flush=True)
     hd = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
     dec = Qwen3DecoderKV(model.model, cfg.num_attention_heads, cfg.num_key_value_heads,
                          hd, getattr(cfg, "rms_norm_eps", 1e-6),
@@ -171,6 +201,11 @@ def main():
 
     seq, past = args.seq, (0 if args.no_cache else args.past)
     hidden = torch.randn(seq, cfg.hidden_size)
+    # 2D mask (seq, kv). Broadcasting it over the attention heads makes pnnx emit
+    # a Reshape with two dynamic (-1) axes that ncnn cannot resolve; we rewrite
+    # those to "copy input dim" (0) in patch_mask_reshape() after conversion. A
+    # 4D mask input avoids the reshape but crashes pnnx pass_level0 on the full
+    # 28-layer graph, so we keep the mask 2D and patch instead.
     mask = torch.zeros(seq, past + seq)
     cos = torch.randn(seq, hd)
     sin = torch.randn(seq, hd)
@@ -195,8 +230,19 @@ def main():
     shapes = [[seq, cfg.hidden_size], [seq, past + seq], [seq, hd], [seq, hd]]
     for _ in range(len(caches)):
         shapes.append([max(1, past), cfg.num_key_value_heads, hd])
-    shape_arg = ",".join("[" + ",".join(str(d) for d in s) + "]f32" for s in shapes)
+    # Second shape set with a DIFFERENT sequence length so pnnx marks the seq
+    # (and past) axes dynamic instead of baking the traced value into Reshape
+    # ops -- without this the graph only runs at the traced seq.
+    seq2, past2 = seq * 2, past * 2
+    shapes2 = [[seq2, cfg.hidden_size], [seq2, past2 + seq2], [seq2, hd], [seq2, hd]]
+    for _ in range(len(caches)):
+        shapes2.append([max(1, past2), cfg.num_key_value_heads, hd])
+
+    def fmt(ss):
+        return ",".join("[" + ",".join(str(d) for d in s) + "]f32" for s in ss)
+    shape_arg = fmt(shapes)
     cmd = [os.environ.get("PNNX", "pnnx"), pt, f"inputshape={shape_arg}",
+           f"inputshape2={fmt(shapes2)}",
            f"ncnnparam={args.out}/{args.name}.ncnn.param",
            f"ncnnbin={args.out}/{args.name}.ncnn.bin", "fp16=0"]
     print("[pnnx]", " ".join(cmd))
@@ -213,6 +259,9 @@ def main():
         gc.collect()
         time.sleep(15)
         subprocess.check_call(cmd)
+
+    patch_mask_reshape(f"{args.out}/{args.name}.ncnn.param")
+
     if args.no_cache:
         print("[note] cacheless decoder: inputs in0..in3, output out0 -- no blob "
               "rename needed. Set \"kv_cache\": false in model.json.")
