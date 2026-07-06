@@ -61,6 +61,8 @@ struct PenguinConfig {
     int hidden_size = 2048;
     int num_layers = 28;             // number of transformer blocks == kv-cache count
     int rope_head_dim = 128;
+    int kv_heads = 8;                // decoder key/value heads (GQA); kv-cache h axis
+    bool kv_cache = true;            // false => cacheless decoder (reprocess full seq)
     float rope_theta = 1000000.0f;
 
     // Chat template pieces (kept explicit so the C++ side matches the HF template).

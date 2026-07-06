@@ -17,3 +17,14 @@ __pycache__/
 /ncnn-install/
 /pvl_selftest/
 /pvl_tok/
+
+# large model artifacts (source HF checkpoint + exported ncnn model dir)
+/Penguin-VL-2B/
+/penguin-vl-2b-ncnn/
+
+# local run/debug logs
+*.log
+/pnnx_*.txt
+/pvl_*.txt
+/diag*.txt
+/embed_err.txt

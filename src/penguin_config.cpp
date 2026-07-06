@@ -33,6 +33,8 @@ PenguinConfig PenguinConfig::load(const std::string& model_dir) {
     const Json& setting = root["setting"];
     cfg.hidden_size = setting.get_int("hidden_size", cfg.hidden_size);
     cfg.num_layers = setting.get_int("attn_cnt", cfg.num_layers);
+    cfg.kv_heads = setting.get_int("kv_heads", cfg.kv_heads);
+    cfg.kv_cache = setting.get_bool("kv_cache", cfg.kv_cache);
     cfg.system_prompt = setting.get_string("system_prompt", cfg.system_prompt);
 
     if (setting.contains("rope")) {

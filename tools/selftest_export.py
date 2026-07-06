@@ -148,31 +148,33 @@ class DecoderKV(nn.Module):
         self.nh, self.nkv, self.hd = nh, nkv, hd
 
     def forward(self, hidden, mask, cos, sin, *caches):
-        # Batch-free token stream (see Attn.forward): 2D Gemms, batch=1 attention.
+        # KV-cache concatenated in 3D along dim 0 (kv_len, nkv, hd) WITHOUT
+        # unsqueezing the cache graph inputs; the batch=1 axis is only added to
+        # intermediates before the attention matmuls (see export_decoder_kvcache).
         x = hidden
         seq = x.shape[0]
-        c = cos.view(1, 1, seq, self.hd)
-        s = sin.view(1, 1, seq, self.hd)
+        cos_h = cos.view(seq, 1, self.hd)
+        sin_h = sin.view(seq, 1, self.hd)
         rep = self.nh // self.nkv
         outs = []
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
             h = layer.input_layernorm(x)
-            q = attn.q_norm(attn.q_proj(h).view(seq, self.nh, self.hd)).unsqueeze(0).transpose(1, 2)
-            k = attn.k_norm(attn.k_proj(h).view(seq, self.nkv, self.hd)).unsqueeze(0).transpose(1, 2)
-            v = attn.v_proj(h).view(seq, self.nkv, self.hd).unsqueeze(0).transpose(1, 2)
-            q = q * c + rotate_half(q) * s
-            k = k * c + rotate_half(k) * s
-            pk = caches[2 * i].unsqueeze(0).transpose(1, 2)
-            pv = caches[2 * i + 1].unsqueeze(0).transpose(1, 2)
-            k = torch.cat([pk, k], dim=2)
-            v = torch.cat([pv, v], dim=2)
-            outs.append(k.transpose(1, 2).squeeze(0))
-            outs.append(v.transpose(1, 2).squeeze(0))
-            kk, vv = repeat_kv(k, rep), repeat_kv(v, rep)
-            att = torch.matmul(q, kk.transpose(-1, -2)) / (self.hd ** 0.5) + mask.view(1, 1, seq, -1)
+            q = attn.q_norm(attn.q_proj(h).view(seq, self.nh, self.hd))
+            k = attn.k_norm(attn.k_proj(h).view(seq, self.nkv, self.hd))
+            v = attn.v_proj(h).view(seq, self.nkv, self.hd)
+            q = q * cos_h + rotate_half(q) * sin_h
+            k = k * cos_h + rotate_half(k) * sin_h
+            k = torch.cat([caches[2 * i], k], dim=0)
+            v = torch.cat([caches[2 * i + 1], v], dim=0)
+            outs.append(k)
+            outs.append(v)
+            q4 = q.unsqueeze(0).transpose(1, 2)
+            k4 = repeat_kv(k.unsqueeze(0).transpose(1, 2), rep)
+            v4 = repeat_kv(v.unsqueeze(0).transpose(1, 2), rep)
+            att = torch.matmul(q4, k4.transpose(-1, -2)) / (self.hd ** 0.5) + mask.view(1, 1, seq, -1)
             att = torch.softmax(att, dim=-1)
-            o = torch.matmul(att, vv).transpose(1, 2).reshape(seq, -1)
+            o = torch.matmul(att, v4).transpose(1, 2).reshape(seq, -1)
             x = x + attn.o_proj(o)
             x = x + layer.mlp(layer.post_attention_layernorm(x))
         return (self.norm(x), *outs)

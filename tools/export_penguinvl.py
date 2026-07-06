@@ -34,13 +34,20 @@ import sys
 import torch
 
 
-def run_pnnx(pt_path, input_shapes, out_prefix):
+def run_pnnx(pt_path, input_shapes, out_prefix, dtypes=None):
     """Invoke pnnx on a traced TorchScript file.
 
     input_shapes: list of shape lists, e.g. [[196, 588]] -> "[196,588]".
+    dtypes: optional per-input pnnx type suffix ("f32", "i64", ...); defaults to
+    "f32" for every input. Integer inputs (e.g. token ids into an Embedding)
+    must be declared i64 or pnnx rejects the traced shape.
     Produces <out_prefix>.ncnn.param / <out_prefix>.ncnn.bin next to pt_path.
     """
-    shape_arg = ",".join("[" + ",".join(str(d) for d in s) + "]f32" for s in input_shapes)
+    if dtypes is None:
+        dtypes = ["f32"] * len(input_shapes)
+    shape_arg = ",".join(
+        "[" + ",".join(str(d) for d in s) + "]" + t
+        for s, t in zip(input_shapes, dtypes))
     cmd = [
         os.environ.get("PNNX", "pnnx"),
         pt_path,
@@ -54,13 +61,14 @@ def run_pnnx(pt_path, input_shapes, out_prefix):
     subprocess.check_call(cmd)
 
 
-def trace_and_export(module, example_inputs, input_shapes, out_prefix, work_dir):
+def trace_and_export(module, example_inputs, input_shapes, out_prefix, work_dir,
+                     dtypes=None):
     module.eval()
     pt_path = os.path.join(work_dir, os.path.basename(out_prefix) + ".pt")
     with torch.no_grad():
         ts = torch.jit.trace(module, example_inputs, check_trace=False)
     ts.save(pt_path)
-    run_pnnx(pt_path, input_shapes, out_prefix)
+    run_pnnx(pt_path, input_shapes, out_prefix, dtypes)
 
 
 # --------------------------------------------------------------------------- #
@@ -101,18 +109,64 @@ def repeat_kv(x, rep):
     return x[:, :, None, :, :].expand(b, nkv, rep, n, hd).reshape(b, nkv * rep, n, hd)
 
 
+class RMSNorm(torch.nn.Module):
+    """Plain fp32 RMSNorm. We re-implement it (instead of reusing the model's
+    Qwen3RMSNorm) so the traced graph contains only the simple pow/mean/rsqrt/mul
+    ops that pnnx converts cleanly. The stock module adds dtype-cast (aten::to)
+    patterns that crash pnnx/torch-jit's shape pass on this toolchain."""
+
+    def __init__(self, weight, eps):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight.detach().float().clone())
+        self.eps = eps
+
+    def forward(self, x):
+        v = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(v + self.eps) * self.weight
+
+
+def _clone_linear(real):
+    """Copy a real nn.Linear into a fresh plain nn.Linear (weights + bias)."""
+    lin = torch.nn.Linear(real.in_features, real.out_features,
+                          bias=real.bias is not None)
+    with torch.no_grad():
+        lin.weight.copy_(real.weight.float())
+        if real.bias is not None:
+            lin.bias.copy_(real.bias.float())
+    return lin
+
+
 class VisionEncoder(torch.nn.Module):
     """Bidirectional Qwen3 encoder over patch embeddings, 2D-RoPE supplied as
-    cos/sin (N, head_dim). Full attention (no mask) for a single image."""
+    cos/sin (N, head_dim). Full attention (no mask) for a single image.
+
+    Each real Qwen3 layer is rebuilt here from plain ops with the real weights
+    copied in, so the traced graph matches the pnnx-verified self-test exactly.
+    Tracing the stock nn.Modules directly crashes pnnx on this torch build."""
 
     def __init__(self, encoder, head_dim, num_heads, num_kv_heads, eps):
         super().__init__()
-        self.layers = encoder.layers
-        self.norm = encoder.norm
         self.head_dim = head_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.eps = eps
+        self.layers = torch.nn.ModuleList()
+        for layer in encoder.layers:
+            a = layer.self_attn
+            self.layers.append(torch.nn.ModuleDict({
+                "input_layernorm": RMSNorm(layer.input_layernorm.weight, eps),
+                "post_attention_layernorm": RMSNorm(layer.post_attention_layernorm.weight, eps),
+                "q_proj": _clone_linear(a.q_proj),
+                "k_proj": _clone_linear(a.k_proj),
+                "v_proj": _clone_linear(a.v_proj),
+                "o_proj": _clone_linear(a.o_proj),
+                "q_norm": RMSNorm(a.q_norm.weight, eps),
+                "k_norm": RMSNorm(a.k_norm.weight, eps),
+                "gate_proj": _clone_linear(layer.mlp.gate_proj),
+                "up_proj": _clone_linear(layer.mlp.up_proj),
+                "down_proj": _clone_linear(layer.mlp.down_proj),
+            }))
+        self.norm = RMSNorm(encoder.norm.weight, eps)
 
     def forward(self, hidden, cos, sin):  # hidden (N, H), cos/sin (N, head_dim)
         # Keep the token-feature stream 2D (N, H) so pnnx->ncnn emits clean 2D
@@ -123,26 +177,25 @@ class VisionEncoder(torch.nn.Module):
         x = hidden  # (N, H)
         c = cos.view(1, 1, cos.shape[0], self.head_dim)
         s = sin.view(1, 1, sin.shape[0], self.head_dim)
-        for layer in self.layers:
+        rep = self.num_heads // self.num_kv_heads
+        for m in self.layers:
             residual = x
-            h = layer.input_layernorm(x)
-            attn = layer.self_attn
+            h = m["input_layernorm"](x)
             N = h.shape[0]
-            q = attn.q_norm(attn.q_proj(h).view(N, self.num_heads, self.head_dim)).unsqueeze(0).transpose(1, 2)
-            k = attn.k_norm(attn.k_proj(h).view(N, self.num_kv_heads, self.head_dim)).unsqueeze(0).transpose(1, 2)
-            v = attn.v_proj(h).view(N, self.num_kv_heads, self.head_dim).unsqueeze(0).transpose(1, 2)
+            q = m["q_norm"](m["q_proj"](h).view(N, self.num_heads, self.head_dim)).unsqueeze(0).transpose(1, 2)
+            k = m["k_norm"](m["k_proj"](h).view(N, self.num_kv_heads, self.head_dim)).unsqueeze(0).transpose(1, 2)
+            v = m["v_proj"](h).view(N, self.num_kv_heads, self.head_dim).unsqueeze(0).transpose(1, 2)
             q = q * c + rotate_half(q) * s
             k = k * c + rotate_half(k) * s
-            rep = self.num_heads // self.num_kv_heads
             k = repeat_kv(k, rep)
             v = repeat_kv(v, rep)
             scores = torch.matmul(q, k.transpose(-1, -2)) / (self.head_dim ** 0.5)
             probs = torch.softmax(scores, dim=-1)
             o = torch.matmul(probs, v).transpose(1, 2).reshape(N, -1)
-            x = residual + attn.o_proj(o)
+            x = residual + m["o_proj"](o)
             residual = x
-            h = layer.post_attention_layernorm(x)
-            x = residual + layer.mlp(h)
+            h = m["post_attention_layernorm"](x)
+            x = residual + m["down_proj"](torch.nn.functional.silu(m["gate_proj"](h)) * m["up_proj"](h))
         x = self.norm(x)
         return x  # (N, H)
 
@@ -198,6 +251,7 @@ def build_model_json(args, cfg, vcfg, out_dir):
         "setting": {
             "hidden_size": cfg.hidden_size,
             "attn_cnt": cfg.num_hidden_layers,
+            "kv_heads": getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
             "system_prompt": "",
             "rope": {
                 "type": "RoPE",
@@ -246,13 +300,17 @@ def main():
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     print(f"[load] {args.model}")
+    # Load in the checkpoint's native dtype first, then cast to fp32. Casting
+    # bf16->fp32 *during* the safetensors load (torch_dtype=torch.float32) can
+    # segfault on some torch builds; converting after load is safe.
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.float32, trust_remote_code=True)
+        args.model, torch_dtype="auto", trust_remote_code=True)
+    model = model.float()
     model.eval()
 
     llm = model.model                 # PenguinVLQwen3Model (VLMMetaModel + Qwen3Model)
     cfg = model.config
-    vision = llm.get_vision_encoder().vision_encoder  # PenguinVLVisionEncoderModel
+    vision = llm.get_vision_encoder()  # PenguinVLVisionEncoderModel
     vcfg = vision.config
     projector = llm.get_vision_projector()
 
@@ -281,15 +339,31 @@ def main():
         Projector(projector), (torch.randn(N, Hvis),), [[N, Hvis]],
         os.path.join(args.out, "vision_projector"), work)
 
+    # The token embedding and lm_head are the two largest sub-graphs (each a
+    # ~vocab*hidden table). pnnx needs 2-3x their size in RAM to convert, so we
+    # drop the rest of the model (decoder layers, vision) first — otherwise the
+    # ~9 GB fp32 model held in this process starves pnnx and it aborts.
+    import gc
+    vocab_size = cfg.vocab_size
+    hidden_size = cfg.hidden_size
+    embed_mod = EmbedTokens(llm.embed_tokens)
+    lmhead_mod = LmHead(model.lm_head)
+    del vision, projector, llm, model
+    gc.collect()
+
     # 4. embed tokens
     trace_and_export(
-        EmbedTokens(llm.embed_tokens), (torch.randint(0, cfg.vocab_size, (8,)),), [[8]],
-        os.path.join(args.out, "embed"), work)
+        embed_mod, (torch.randint(0, vocab_size, (8,)),), [[8]],
+        os.path.join(args.out, "embed"), work, dtypes=["i64"])
+    del embed_mod
+    gc.collect()
 
     # 6. lm_head
     trace_and_export(
-        LmHead(model.lm_head), (torch.randn(1, cfg.hidden_size),), [[1, cfg.hidden_size]],
+        lmhead_mod, (torch.randn(1, hidden_size),), [[1, hidden_size]],
         os.path.join(args.out, "lm_head"), work)
+    del lmhead_mod
+    gc.collect()
 
     # 5. decoder (KV-cache). This uses the ncnn_llm / nihui KV-cache decoder
     #    export convention; see docs/EXPORT.md. The traceable wrapper lives in

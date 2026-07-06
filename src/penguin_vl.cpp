@@ -168,13 +168,73 @@ std::string PenguinVL::chat(const std::string& user_text, const std::string& ima
         if (!vision_) throw std::runtime_error("model has no vision encoder but an image was given");
         ncnn::Mat bgr = load_image_to_ncnn_mat(image_path);
         if (ncnn_mat_empty(bgr)) throw std::runtime_error("failed to load image: " + image_path);
+        std::fprintf(stderr, "[dbg] image loaded %dx%d\n", bgr.w, bgr.h); std::fflush(stderr);
         PreprocessResult pp = preprocess_image(bgr, cfg_.vision);
+        std::fprintf(stderr, "[dbg] preprocess grid=%dx%d pv=%dx%dx%d\n", pp.grid_h, pp.grid_w,
+                     pp.pixel_values.w, pp.pixel_values.h, pp.pixel_values.c); std::fflush(stderr);
         image_embeds = vision_->encode(pp.pixel_values, pp.grid_h, pp.grid_w);
+        std::fprintf(stderr, "[dbg] vision encoded tokens=%d dim=%d\n", image_embeds.h, image_embeds.w); std::fflush(stderr);
     }
 
     const std::string prompt = build_prompt(user_text, has_image, cfg.add_think);
     std::vector<int> token_ids;
     ncnn::Mat token_embed = build_input_embeds(prompt, image_embeds, token_ids);
+    std::fprintf(stderr, "[dbg] input embeds tokens=%d hidden=%d\n", token_embed.h, token_embed.w); std::fflush(stderr);
+
+    // ---- cacheless generation path ----
+    // The decoder subgraph exposes only (in0..in3)->out0 and reprocesses the full
+    // running sequence every step. This avoids pnnx/ncnn KV-cache concat limits at
+    // the cost of O(n^2) compute; correct and fully self-contained.
+    if (!cfg_.kv_cache) {
+        const int head_dim = cfg_.rope_head_dim;
+        const float theta = cfg_.rope_theta;
+        const int H = token_embed.w;
+        ncnn::Mat running = token_embed.clone();  // (H, n)
+        std::string output;
+        for (int step = 0; step < cfg.max_new_tokens; ++step) {
+            const int n = running.h;
+            ncnn::Mat mask = make_causal_mask(n, 0);
+            ncnn::Mat cos_c, sin_c;
+            generate_rope_embed_cache_full(n, head_dim, 0, cos_c, sin_c, theta);
+
+            ncnn::Mat hidden_all;
+            {
+                ncnn::Extractor ex = decoder_net_->create_extractor();
+                ex.input("in0", running);
+                ex.input("in1", mask);
+                ex.input("in2", cos_c);
+                ex.input("in3", sin_c);
+                ex.extract("out0", hidden_all);  // (H, n)
+            }
+            ncnn::Mat last = hidden_all.row_range(n - 1, 1).clone();  // (H, 1)
+            ncnn::Mat logits = lm_head(last);
+
+            int next;
+            if (!cfg.do_sample) {
+                next = argmax1d(logits);
+            } else {
+                std::vector<float> probs(logits.w);
+                const float* p = logits;
+                for (int i = 0; i < logits.w; ++i) probs[i] = p[i];
+                softmax_vec(probs, cfg.temperature);
+                if (cfg.top_k > 0) apply_top_k(probs, cfg.top_k);
+                if (cfg.top_p < 1.0f) apply_top_p(probs, cfg.top_p);
+                next = sample_from_probs(probs);
+            }
+            if (next == eos_id_) break;
+
+            std::string piece = tok_->decode({next}, /*skip_special_tokens=*/false);
+            output += piece;
+            if (on_token) on_token(piece);
+
+            ncnn::Mat next_embed = embed_token(next);  // (H, 1)
+            ncnn::Mat grown(H, n + 1);
+            std::memcpy(grown.row(0), running.row(0), (size_t)H * n * sizeof(float));
+            std::memcpy(grown.row(n), next_embed.row(0), (size_t)H * sizeof(float));
+            running = grown;
+        }
+        return output;
+    }
 
     const int total = (int)token_ids.size();
     if (total < 1) throw std::runtime_error("empty prompt");
@@ -187,11 +247,25 @@ std::string PenguinVL::chat(const std::string& user_text, const std::string& ima
     KVCache kv;
 
     // ---- prefill pass A: first m tokens (no existing cache) ----
+    // The exported decoder graph always concatenates cache_k{i}; ncnn's Concat
+    // propagates emptiness, so a truly empty cache yields an empty output. We
+    // therefore prime the concat with a single zero "dummy" cache slot (c=1),
+    // mask it out in attention, and strip it from the extracted cache so the
+    // downstream passes see a clean past of exactly m. Cache mat layout is
+    // (w=head_dim, h=kv_heads, c=past).
     if (m > 0) {
         ncnn::Mat embeds_a = token_embed.row_range(0, m).clone();
-        ncnn::Mat mask = make_causal_mask(m, 0);
+        // mask over kv_len = 1 (dummy) + m, for m query rows. Column 0 is the
+        // dummy (always masked); column 1+j is real token j (causal: row i
+        // attends j <= i).
+        ncnn::Mat mask(1 + m, m);
+        for (int i = 0; i < m; ++i) {
+            float* row = mask.row(i);
+            row[0] = -1e38f;
+            for (int j = 0; j < m; ++j) row[1 + j] = (j <= i) ? 0.0f : -1e38f;
+        }
         ncnn::Mat cos_c, sin_c;
-        generate_rope_embed_cache(m, head_dim, 0, cos_c, sin_c, theta);
+        generate_rope_embed_cache_full(m, head_dim, 0, cos_c, sin_c, theta);
 
         ncnn::Extractor ex = decoder_net_->create_extractor();
         ex.input("in0", embeds_a);
@@ -199,14 +273,31 @@ std::string PenguinVL::chat(const std::string& user_text, const std::string& ima
         ex.input("in2", cos_c);
         ex.input("in3", sin_c);
         for (int i = 0; i < L; ++i) {
+            char ki[24], vi[24];
+            std::snprintf(ki, sizeof(ki), "cache_k%d", i);
+            std::snprintf(vi, sizeof(vi), "cache_v%d", i);
+            ncnn::Mat dummy(head_dim, cfg_.kv_heads, 1);
+            dummy.fill(0.0f);
+            ex.input(ki, dummy);
+            ex.input(vi, dummy);
+        }
+        for (int i = 0; i < L; ++i) {
             char ko[24], vo[24];
             std::snprintf(ko, sizeof(ko), "out_cache_k%d", i);
             std::snprintf(vo, sizeof(vo), "out_cache_v%d", i);
             ncnn::Mat k, v;
             ex.extract(ko, k);
             ex.extract(vo, v);
-            kv.emplace_back(std::move(k), std::move(v));
+            if (i == 0) {
+                std::fprintf(stderr, "[dbg] A raw out_cache_k0 (w=%d h=%d c=%d)\n",
+                             k.w, k.h, k.c); std::fflush(stderr);
+            }
+            // Drop the leading dummy cache slot (channel 0) -> clean past = m.
+            kv.emplace_back(k.channel_range(1, k.c - 1).clone(),
+                            v.channel_range(1, v.c - 1).clone());
         }
+        std::fprintf(stderr, "[dbg] prefill A done m=%d kv0(w=%d h=%d c=%d)\n",
+                     m, kv[0].first.w, kv[0].first.h, kv[0].first.c); std::fflush(stderr);
     } else {
         kv.resize(L);
     }
@@ -219,7 +310,7 @@ std::string PenguinVL::chat(const std::string& user_text, const std::string& ima
         ncnn::Mat mask(past + 1, 1);
         mask.fill(0.0f);
         ncnn::Mat cos_c, sin_c;
-        generate_rope_embed_cache(1, head_dim, past, cos_c, sin_c, theta);
+        generate_rope_embed_cache_full(1, head_dim, past, cos_c, sin_c, theta);
 
         ncnn::Extractor ex = decoder_net_->create_extractor();
         ex.input("in0", embeds_b);
@@ -246,8 +337,11 @@ std::string PenguinVL::chat(const std::string& user_text, const std::string& ima
         }
         ncnn::Mat hidden;
         ex.extract("out0", hidden);
+        std::fprintf(stderr, "[dbg] prefill B hidden=%dx%d\n", hidden.w, hidden.h); std::fflush(stderr);
         ncnn::Mat logits = lm_head(hidden);
+        std::fprintf(stderr, "[dbg] lm_head logits w=%d\n", logits.w); std::fflush(stderr);
         cur_token = argmax1d(logits);
+        std::fprintf(stderr, "[dbg] first token=%d\n", cur_token); std::fflush(stderr);
     }
 
     // ---- autoregressive decode ----
@@ -263,10 +357,10 @@ std::string PenguinVL::chat(const std::string& user_text, const std::string& ima
 
         ncnn::Mat cur_embed = embed_token(cur_token);
         ncnn::Mat cos_c, sin_c;
-        generate_rope_embed_cache(1, head_dim, position, cos_c, sin_c, theta);
+        generate_rope_embed_cache_full(1, head_dim, position, cos_c, sin_c, theta);
         ++position;
 
-        const int past = kv[0].first.h;
+        const int past = kv[0].first.c;  // cache seq length lives on the c axis
         ncnn::Mat mask(past + 1, 1);
         mask.fill(0.0f);
 
