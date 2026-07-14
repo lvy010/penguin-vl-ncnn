@@ -11,6 +11,7 @@ golden/
 __pycache__/
 *.pyc
 *.pt
+*.npy
 
 # local build / test artifacts (ncnn source+install, self-test exports)
 /ncnn/
