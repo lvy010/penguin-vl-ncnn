@@ -47,6 +47,40 @@ Dump ncnn intermediates by calling each `ncnn::Extractor` in isolation and
 
 ## 4. Regression
 
+### Penguin-VL vision RoPE export note
+
+Penguin-VL supplies a full-width `(tokens, head_dim)` cos/sin cache. The
+vision export therefore keeps RoPE as explicit slice/multiply/subtract/add/
+concat operations in `tools/export_penguinvl.py`. It must not be reduced to
+ncnn's fused `RotaryEmbed`, whose current contract reuses only the first
+`head_dim/2` cache values for both halves. Simply cropping the cache changes
+Penguin-VL's math when the two cache halves differ. The validated CPU-SDPA
+reference is a deterministic reference for alignment, not a FlashAttention
+bitwise guarantee. A future general ncnn fix may add full-cache support to
+`RotaryEmbed`.
+
 Once a `(prompt, image)` pair matches, commit its `prompt.txt` + `output.txt`
 under `assets/golden/` and add a scripted diff so future changes can't silently
 regress the text.
+
+### 真实权重手工回归
+
+The Penguin-VL-2B vision path was checked manually with the local checkpoint,
+using the CPU-SDPA fallback as the PyTorch vision reference. These results are
+not part of CI and do not imply FlashAttention bitwise identity.
+
+| Comparison | max_abs | mean_abs | RMSE | cosine |
+| --- | ---: | ---: | ---: | ---: |
+| Patch isolated | 2.136e-4 | 2.897e-6 | 6.489e-6 | 1.0 |
+| Encoder isolated | 1.953e-3 | 5.167e-5 | 8.475e-5 | 0.99999833 |
+| Projector isolated | 0.26417 | 0.004512 | 0.007690 | 0.99999839 |
+| Patch in serial chain | 2.136e-4 | 2.897e-6 | 6.489e-6 | 1.0 |
+| Encoder after ncnn patch | 0.014249 | 7.037e-5 | 2.658e-4 | 0.99998307 |
+| Projector after ncnn encoder | 1.57695 | 0.006385 | 0.026355 | 0.99997789 |
+
+The isolated module checks satisfy the current module thresholds: patch `1e-3`,
+encoder `1e-2`, and projector `1e-2`. No cumulative threshold for the complete
+vision chain is defined here, so the serial values are reported without a
+pass/fail claim. Serial error includes upstream propagation and must not be
+attributed solely to the last module. Checkpoint files, ncnn `param/bin`, and
+NumPy reference/output files must not be committed; this is a manual regression.
