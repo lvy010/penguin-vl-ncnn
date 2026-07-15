@@ -16,7 +16,8 @@ pip install pnnx numpy
 ## 1. Export the vision + decoder sub-graphs with pnnx
 
 ```bash
-python tools/selftest_export.py --out /tmp/pvl_selftest --layers 2 --n 100
+python tools/selftest_export.py --out /tmp/pvl_selftest --layers 2 --n 100 \
+  --pnnx /path/to/pnnx
 ```
 
 Produces `vision_patch_embed`, `vision_encoder`, `vision_projector` and a small

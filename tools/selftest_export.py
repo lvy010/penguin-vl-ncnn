@@ -14,7 +14,10 @@
 
 import argparse
 import os
+import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -180,14 +183,14 @@ class DecoderKV(nn.Module):
         return (self.norm(x), *outs)
 
 
-def export(module, example, shapes, prefix):
+def export(module, example, shapes, prefix, pnnx):
     module.eval()
     pt = prefix + ".pt"
     with torch.no_grad():
         ts = torch.jit.trace(module, example, check_trace=False)
     ts.save(pt)
     shape_arg = ",".join("[" + ",".join(str(d) for d in s) + "]f32" for s in shapes)
-    cmd = ["pnnx", pt, f"inputshape={shape_arg}",
+    cmd = [pnnx, pt, f"inputshape={shape_arg}",
            f"ncnnparam={prefix}.ncnn.param", f"ncnnbin={prefix}.ncnn.bin", "fp16=0"]
     print("[pnnx]", " ".join(cmd))
     subprocess.check_call(cmd, stdout=subprocess.DEVNULL)
@@ -195,10 +198,24 @@ def export(module, example, shapes, prefix):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="/tmp/pvl_selftest")
+    ap.add_argument(
+        "--out",
+        default=str(Path(tempfile.gettempdir()) / "pvl_selftest"),
+        help="Output directory (default: the platform temporary directory).",
+    )
+    ap.add_argument(
+        "--pnnx",
+        default=shutil.which("pnnx"),
+        help="pnnx executable (default: resolve pnnx from PATH).",
+    )
     ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--n", type=int, default=100)
     args = ap.parse_args()
+    if not args.pnnx:
+        ap.error("pnnx was not found on PATH; pass --pnnx /path/to/pnnx")
+    pnnx = str(Path(args.pnnx).expanduser().resolve())
+    if not Path(pnnx).is_file():
+        ap.error(f"pnnx executable not found: {pnnx}")
     os.makedirs(args.out, exist_ok=True)
 
     torch.manual_seed(0)
@@ -207,12 +224,12 @@ def main():
     N = args.n
 
     export(PatchEmbed(3 * PS * PS, H), (torch.randn(N, 3 * PS * PS),),
-           [[N, 3 * PS * PS]], os.path.join(args.out, "vision_patch_embed"))
+           [[N, 3 * PS * PS]], os.path.join(args.out, "vision_patch_embed"), pnnx)
     export(VisionEncoder(H, NH, NKV, HD, INTER, args.layers),
            (torch.randn(N, H), torch.randn(N, HD), torch.randn(N, HD)),
-           [[N, H], [N, HD], [N, HD]], os.path.join(args.out, "vision_encoder"))
+           [[N, H], [N, HD], [N, HD]], os.path.join(args.out, "vision_encoder"), pnnx)
     export(Projector(H, HLLM), (torch.randn(N, H),), [[N, H]],
-           os.path.join(args.out, "vision_projector"))
+           os.path.join(args.out, "vision_projector"), pnnx)
 
     # Decoder KV-cache conversion check (tiny dims, past=4, seq=3, 2 layers).
     dh, dnh, dnkv, dhd, dinter = 64, 4, 2, 16, 128
@@ -226,7 +243,7 @@ def main():
           torch.randn(seq, dhd), torch.randn(seq, dhd), *caches)
     shapes = [[seq, dh], [seq, past + seq], [seq, dhd], [seq, dhd]]
     shapes += [[past, dnkv, dhd]] * len(caches)
-    export(dec, ex, shapes, os.path.join(args.out, "decoder"))
+    export(dec, ex, shapes, os.path.join(args.out, "decoder"), pnnx)
     print("[done] wrote ncnn sub-graphs to", args.out)
 
 
