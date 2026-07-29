@@ -60,6 +60,7 @@ target_link_libraries(tok_selftest PRIVATE penguinvl_runtime)
 
 # --- tests ------------------------------------------------------------------
 if(PENGUINVL_BUILD_TESTS)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     enable_testing()
     add_executable(penguinvl_tests
         tests/test_main.cpp
@@ -70,4 +71,7 @@ if(PENGUINVL_BUILD_TESTS)
     )
     target_link_libraries(penguinvl_tests PRIVATE penguinvl_runtime)
     add_test(NAME penguinvl_tests COMMAND penguinvl_tests)
+    add_test(NAME penguinvl_unfused_rope_test
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_unfused_rope.py)
 endif()

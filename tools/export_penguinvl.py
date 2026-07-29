@@ -147,6 +147,8 @@ class VisionEncoder(torch.nn.Module):
     def __init__(self, encoder, head_dim, num_heads, num_kv_heads, eps):
         super().__init__()
         self.head_dim = head_dim
+        if head_dim % 2 != 0:
+            raise ValueError(f"Rotary head_dim must be even, got {head_dim}")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.eps = eps
@@ -185,8 +187,16 @@ class VisionEncoder(torch.nn.Module):
             q = m["q_norm"](m["q_proj"](h).view(N, self.num_heads, self.head_dim)).unsqueeze(0).transpose(1, 2)
             k = m["k_norm"](m["k_proj"](h).view(N, self.num_kv_heads, self.head_dim)).unsqueeze(0).transpose(1, 2)
             v = m["v_proj"](h).view(N, self.num_kv_heads, self.head_dim).unsqueeze(0).transpose(1, 2)
-            q = q * c + rotate_half(q) * s
-            k = k * c + rotate_half(k) * s
+            # Keep Penguin-VL's full-width RoPE explicit. ncnn RotaryEmbed
+            # consumes a half-width cache, so fusing this pattern changes the
+            # math when cos/sin[..., :half] != cos/sin[..., half:].
+            half = self.head_dim // 2
+            q1, q2 = q[..., :half], q[..., half:]
+            k1, k2 = k[..., :half], k[..., half:]
+            q = torch.cat((q1 * c[..., :half] - q2 * s[..., :half],
+                           q2 * c[..., half:] + q1 * s[..., half:]), dim=-1)
+            k = torch.cat((k1 * c[..., :half] - k2 * s[..., :half],
+                           k2 * c[..., half:] + k1 * s[..., half:]), dim=-1)
             k = repeat_kv(k, rep)
             v = repeat_kv(v, rep)
             scores = torch.matmul(q, k.transpose(-1, -2)) / (self.head_dim ** 0.5)
